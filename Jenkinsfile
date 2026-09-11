@@ -11,7 +11,7 @@ pipeline {
 
         stage('Test') {
             steps {
-                echo 'MetricGuard Jenkins pipeline started successfully'
+                echo 'MetricGuard automatic rollback pipeline started'
             }
         }
 
@@ -21,54 +21,153 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Check Blue Health') {
             steps {
-                sh '''
-                    echo "Building Docker image..."
-                    docker build -t v2:${BUILD_NUMBER} .
-                    echo "Docker image built successfully"
-                '''
+                script {
+                    def blueStatus = sh(
+                        script: '''
+                            curl -s -o /dev/null -w "%{http_code}" \
+                            --connect-timeout 5 \
+                            http://localhost:5001/health || true
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Blue HTTP status: ${blueStatus}"
+
+                    if (blueStatus == '200') {
+                        env.BLUE_HEALTHY = 'true'
+                        echo "Blue V2 is healthy"
+                    } else {
+                        env.BLUE_HEALTHY = 'false'
+                        echo "Blue V2 is UNHEALTHY"
+                    }
+                }
             }
         }
 
-        stage('Check Blue Environment') {
+        stage('Check Green Health') {
             steps {
-                sh '''
-                    echo "Checking Blue environment on port 5001..."
-                    curl -f http://localhost:5001/health
-                    echo "Blue environment is healthy"
-                '''
-            }
-        }
+                script {
+                    def greenStatus = sh(
+                        script: '''
+                            curl -s -o /dev/null -w "%{http_code}" \
+                            --connect-timeout 5 \
+                            http://localhost:5000/health || true
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
-        stage('Check Green Environment') {
-            steps {
-                sh '''
-                    echo "Checking Green environment on port 5000..."
-                    curl -f http://localhost:5000/health
-                    echo "Green environment is healthy"
-                '''
+                    echo "Green HTTP status: ${greenStatus}"
+
+                    if (greenStatus == '200') {
+                        env.GREEN_HEALTHY = 'true'
+                        echo "Green V1 is healthy"
+                    } else {
+                        env.GREEN_HEALTHY = 'false'
+                        echo "Green V1 is UNHEALTHY"
+                    }
+                }
             }
         }
 
         stage('Detect Active Environment') {
             steps {
-                sh '''
-                    echo "Detecting active environment from Nginx..."
+                script {
+                    if (sh(
+                        script: 'grep -q "proxy_pass http://127.0.0.1:5001" /etc/nginx/sites-available/green',
+                        returnStatus: true
+                    ) == 0) {
 
-                    if grep -q "proxy_pass http://127.0.0.1:5001" /etc/nginx/sites-available/green; then
-                        echo "Currently active environment: BLUE"
-                        echo "Deployment target: GREEN"
+                        env.ACTIVE_ENVIRONMENT = 'BLUE'
+                        env.BACKUP_ENVIRONMENT = 'GREEN'
 
-                    elif grep -q "proxy_pass http://127.0.0.1:5000" /etc/nginx/sites-available/green; then
-                        echo "Currently active environment: GREEN"
-                        echo "Deployment target: BLUE"
+                        echo "Active environment: BLUE"
+                        echo "Backup environment: GREEN"
 
-                    else
-                        echo "ERROR: Could not detect active environment"
-                        exit 1
-                    fi
-                '''
+                    } else if (sh(
+                        script: 'grep -q "proxy_pass http://127.0.0.1:5000" /etc/nginx/sites-available/green',
+                        returnStatus: true
+                    ) == 0) {
+
+                        env.ACTIVE_ENVIRONMENT = 'GREEN'
+                        env.BACKUP_ENVIRONMENT = 'BLUE'
+
+                        echo "Active environment: GREEN"
+                        echo "Backup environment: BLUE"
+
+                    } else {
+                        error('Unable to detect active environment from Nginx')
+                    }
+                }
+            }
+        }
+
+        stage('Automatic Rollback') {
+            steps {
+                script {
+
+                    if (
+                        env.ACTIVE_ENVIRONMENT == 'BLUE' &&
+                        env.BLUE_HEALTHY == 'false' &&
+                        env.GREEN_HEALTHY == 'true'
+                    ) {
+
+                        echo "Blue V2 is unhealthy"
+                        echo "Green V1 is healthy"
+                        echo "Starting automatic rollback from Blue to Green"
+
+                        sh '''
+                            sudo sed -i 's|proxy_pass http://127.0.0.1:5001;|proxy_pass http://127.0.0.1:5000;|' /etc/nginx/sites-available/green
+
+                            echo "Testing Nginx configuration..."
+                            sudo nginx -t
+
+                            echo "Reloading Nginx..."
+                            sudo systemctl reload nginx
+                        '''
+
+                        echo "Nginx traffic switched from Blue to Green"
+
+                    } else {
+                        echo "Rollback conditions not satisfied"
+                        echo "No rollback performed"
+                    }
+                }
+            }
+        }
+
+        stage('Verify Production Traffic') {
+            steps {
+                script {
+                    def productionStatus = sh(
+                        script: '''
+                            curl -s -o /dev/null -w "%{http_code}" \
+                            --connect-timeout 5 \
+                            http://localhost/health || true
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Production HTTP status: ${productionStatus}"
+
+                    if (
+                        env.ACTIVE_ENVIRONMENT == 'BLUE' &&
+                        env.BLUE_HEALTHY == 'false' &&
+                        env.GREEN_HEALTHY == 'true'
+                    ) {
+
+                        if (productionStatus == '200') {
+                            echo "Automatic rollback successful"
+                            echo "Production traffic is now reaching Green V1"
+                        } else {
+                            error('Rollback attempted but production is still unhealthy')
+                        }
+
+                    } else {
+                        echo "Production remains on the current active environment"
+                    }
+                }
             }
         }
 
