@@ -1,9 +1,9 @@
 pipeline {
     agent any
 
-    triggers {
-        cron('* * * * *')
-    }
+   triggers {
+    cron('H/1 * * * *')
+}
 
     options {
         disableConcurrentBuilds()
