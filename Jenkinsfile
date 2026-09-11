@@ -19,7 +19,7 @@ pipeline {
 
         stage('Test') {
             steps {
-                echo 'MetricGuard automatic rollback monitoring started'
+                echo 'MetricGuard automatic rollback and failback monitoring started'
             }
         }
 
@@ -84,26 +84,40 @@ pipeline {
         stage('Detect Active Environment') {
             steps {
                 script {
+
                     if (
                         sh(
-                            script: 'grep -q "proxy_pass http://127.0.0.1:5001" /etc/nginx/sites-available/green',
+                            script: '''
+                                grep -q "proxy_pass http://127.0.0.1:5001" \
+                                /etc/nginx/sites-available/green
+                            ''',
                             returnStatus: true
                         ) == 0
                     ) {
+
                         env.ACTIVE_ENVIRONMENT = 'BLUE'
+
                         echo "Active environment: BLUE"
+                        echo "Nginx is routing traffic to Blue V2"
 
                     } else if (
                         sh(
-                            script: 'grep -q "proxy_pass http://127.0.0.1:5000" /etc/nginx/sites-available/green',
+                            script: '''
+                                grep -q "proxy_pass http://127.0.0.1:5000" \
+                                /etc/nginx/sites-available/green
+                            ''',
                             returnStatus: true
                         ) == 0
                     ) {
+
                         env.ACTIVE_ENVIRONMENT = 'GREEN'
+
                         echo "Active environment: GREEN"
+                        echo "Nginx is routing traffic to Green V1"
 
                     } else {
-                        error('Unable to detect active environment from Nginx')
+
+                        error('Unable to detect active environment from Nginx configuration')
                     }
                 }
             }
@@ -121,15 +135,17 @@ pipeline {
 
                         echo "Blue V2 is unhealthy"
                         echo "Green V1 is healthy"
-                        echo "Starting automatic rollback"
+                        echo "Starting automatic rollback from Blue to Green"
 
                         sh '''
                             sudo /usr/local/bin/metricguard-rollback
                         '''
 
                         env.ROLLBACK_PERFORMED = 'true'
+                        env.FAILBACK_PERFORMED = 'false'
 
-                        echo "Traffic successfully switched from Blue to Green"
+                        echo "Automatic rollback completed"
+                        echo "Production traffic is now routed to Green V1"
 
                     } else if (
                         env.ACTIVE_ENVIRONMENT == 'BLUE' &&
@@ -137,13 +153,53 @@ pipeline {
                         env.GREEN_HEALTHY == 'false'
                     ) {
 
-                        error('Both Blue and Green are unhealthy. Rollback is unsafe.')
+                        error(
+                            'Both Blue and Green are unhealthy. ' +
+                            'Rollback cannot be safely performed.'
+                        )
 
                     } else {
 
                         env.ROLLBACK_PERFORMED = 'false'
+
                         echo "Rollback conditions not satisfied"
                         echo "No rollback performed"
+                    }
+                }
+            }
+        }
+
+        stage('Automatic Failback') {
+            steps {
+                script {
+
+                    if (
+                        env.ACTIVE_ENVIRONMENT == 'GREEN' &&
+                        env.BLUE_HEALTHY == 'true' &&
+                        env.GREEN_HEALTHY == 'true'
+                    ) {
+
+                        echo "Green V1 is currently active"
+                        echo "Blue V2 has recovered"
+                        echo "Green V1 is healthy"
+                        echo "Starting automatic failback from Green to Blue"
+
+                        sh '''
+                            sudo /usr/local/bin/metricguard-failback
+                        '''
+
+                        env.FAILBACK_PERFORMED = 'true'
+                        env.ROLLBACK_PERFORMED = 'false'
+
+                        echo "Automatic failback completed"
+                        echo "Production traffic is now routed to Blue V2"
+
+                    } else {
+
+                        env.FAILBACK_PERFORMED = 'false'
+
+                        echo "Failback conditions not satisfied"
+                        echo "No failback performed"
                     }
                 }
             }
@@ -155,7 +211,8 @@ pipeline {
 
                     def productionResponse = sh(
                         script: '''
-                            curl -s --connect-timeout 5 \
+                            curl -s \
+                            --connect-timeout 5 \
                             --max-time 10 \
                             http://localhost/health || true
                         ''',
@@ -167,17 +224,52 @@ pipeline {
                     if (env.ROLLBACK_PERFORMED == 'true') {
 
                         if (productionResponse.contains('"version":"1.0"')) {
-                            echo "Automatic rollback successful"
-                            echo "Production traffic is now reaching Green V1"
+
+                            echo "Automatic rollback verified successfully"
+                            echo "Production is serving Green V1"
+
                         } else {
-                            error('Rollback was attempted but Green V1 was not detected')
+
+                            error(
+                                'Rollback was attempted, but production is not serving Green V1'
+                            )
+                        }
+
+                    } else if (env.FAILBACK_PERFORMED == 'true') {
+
+                        if (productionResponse.contains('"version":"2.0"')) {
+
+                            echo "Automatic failback verified successfully"
+                            echo "Production is serving Blue V2 again"
+
+                        } else {
+
+                            error(
+                                'Failback was attempted, but production is not serving Blue V2'
+                            )
                         }
 
                     } else {
-                        echo "Production remains on the current active environment"
+
+                        echo "No traffic switch performed"
+                        echo "Current production response: ${productionResponse}"
                     }
                 }
             }
+        }
+    }
+
+    post {
+        always {
+            echo 'MetricGuard monitoring cycle completed'
+        }
+
+        success {
+            echo 'Monitoring pipeline completed successfully'
+        }
+
+        failure {
+            echo 'Monitoring pipeline failed. Check the Jenkins console output.'
         }
     }
 }
