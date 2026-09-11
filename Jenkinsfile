@@ -1,6 +1,14 @@
 pipeline {
     agent any
 
+    triggers {
+        cron('* * * * *')
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
     stages {
 
         stage('Checkout') {
@@ -11,7 +19,7 @@ pipeline {
 
         stage('Test') {
             steps {
-                echo 'MetricGuard automatic rollback pipeline started'
+                echo 'MetricGuard automatic rollback monitoring started'
             }
         }
 
@@ -28,6 +36,7 @@ pipeline {
                         script: '''
                             curl -s -o /dev/null -w "%{http_code}" \
                             --connect-timeout 5 \
+                            --max-time 10 \
                             http://localhost:5001/health || true
                         ''',
                         returnStdout: true
@@ -53,6 +62,7 @@ pipeline {
                         script: '''
                             curl -s -o /dev/null -w "%{http_code}" \
                             --connect-timeout 5 \
+                            --max-time 10 \
                             http://localhost:5000/health || true
                         ''',
                         returnStdout: true
@@ -74,27 +84,23 @@ pipeline {
         stage('Detect Active Environment') {
             steps {
                 script {
-                    if (sh(
-                        script: 'grep -q "proxy_pass http://127.0.0.1:5001" /etc/nginx/sites-available/green',
-                        returnStatus: true
-                    ) == 0) {
-
+                    if (
+                        sh(
+                            script: 'grep -q "proxy_pass http://127.0.0.1:5001" /etc/nginx/sites-available/green',
+                            returnStatus: true
+                        ) == 0
+                    ) {
                         env.ACTIVE_ENVIRONMENT = 'BLUE'
-                        env.BACKUP_ENVIRONMENT = 'GREEN'
-
                         echo "Active environment: BLUE"
-                        echo "Backup environment: GREEN"
 
-                    } else if (sh(
-                        script: 'grep -q "proxy_pass http://127.0.0.1:5000" /etc/nginx/sites-available/green',
-                        returnStatus: true
-                    ) == 0) {
-
+                    } else if (
+                        sh(
+                            script: 'grep -q "proxy_pass http://127.0.0.1:5000" /etc/nginx/sites-available/green',
+                            returnStatus: true
+                        ) == 0
+                    ) {
                         env.ACTIVE_ENVIRONMENT = 'GREEN'
-                        env.BACKUP_ENVIRONMENT = 'BLUE'
-
                         echo "Active environment: GREEN"
-                        echo "Backup environment: BLUE"
 
                     } else {
                         error('Unable to detect active environment from Nginx')
@@ -115,21 +121,27 @@ pipeline {
 
                         echo "Blue V2 is unhealthy"
                         echo "Green V1 is healthy"
-                        echo "Starting automatic rollback from Blue to Green"
+                        echo "Starting automatic rollback"
 
                         sh '''
-                            sudo sed -i 's|proxy_pass http://127.0.0.1:5001;|proxy_pass http://127.0.0.1:5000;|' /etc/nginx/sites-available/green
-
-                            echo "Testing Nginx configuration..."
-                            sudo nginx -t
-
-                            echo "Reloading Nginx..."
-                            sudo systemctl reload nginx
+                            sudo /usr/local/bin/metricguard-rollback
                         '''
 
-                        echo "Nginx traffic switched from Blue to Green"
+                        env.ROLLBACK_PERFORMED = 'true'
+
+                        echo "Traffic successfully switched from Blue to Green"
+
+                    } else if (
+                        env.ACTIVE_ENVIRONMENT == 'BLUE' &&
+                        env.BLUE_HEALTHY == 'false' &&
+                        env.GREEN_HEALTHY == 'false'
+                    ) {
+
+                        error('Both Blue and Green are unhealthy. Rollback is unsafe.')
 
                     } else {
+
+                        env.ROLLBACK_PERFORMED = 'false'
                         echo "Rollback conditions not satisfied"
                         echo "No rollback performed"
                     }
@@ -140,28 +152,25 @@ pipeline {
         stage('Verify Production Traffic') {
             steps {
                 script {
-                    def productionStatus = sh(
+
+                    def productionResponse = sh(
                         script: '''
-                            curl -s -o /dev/null -w "%{http_code}" \
-                            --connect-timeout 5 \
+                            curl -s --connect-timeout 5 \
+                            --max-time 10 \
                             http://localhost/health || true
                         ''',
                         returnStdout: true
                     ).trim()
 
-                    echo "Production HTTP status: ${productionStatus}"
+                    echo "Production response: ${productionResponse}"
 
-                    if (
-                        env.ACTIVE_ENVIRONMENT == 'BLUE' &&
-                        env.BLUE_HEALTHY == 'false' &&
-                        env.GREEN_HEALTHY == 'true'
-                    ) {
+                    if (env.ROLLBACK_PERFORMED == 'true') {
 
-                        if (productionStatus == '200') {
+                        if (productionResponse.contains('"version":"1.0"')) {
                             echo "Automatic rollback successful"
                             echo "Production traffic is now reaching Green V1"
                         } else {
-                            error('Rollback attempted but production is still unhealthy')
+                            error('Rollback was attempted but Green V1 was not detected')
                         }
 
                     } else {
@@ -170,6 +179,5 @@ pipeline {
                 }
             }
         }
-
     }
 }
